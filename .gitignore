@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.spec
+release/
+
+# 构建产物
+assets/*.ico
+assets/*.png
+
+# 运行数据
+data/
+startup.log
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
