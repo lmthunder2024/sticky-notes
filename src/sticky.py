@@ -215,6 +215,7 @@ class StickyApp:
         self._save_job = None
         self._loading = False
         self._dragging = False
+        self._last_pos = None
         self.collapsed = False
         self._expanded_h = self.st["h"]
         self.var_topmost = tk.BooleanVar(master=self.root, value=bool(self.st["topmost"]))
@@ -708,17 +709,52 @@ class StickyApp:
         self._dx = e.x_root - self.root.winfo_x()
         self._dy = e.y_root - self.root.winfo_y()
         self._dragging = True
-        self._set_layered(False)   # 拖动期间不透明，避免合成闪黑
+        self._last_pos = None
+        # 拖动期间切到完全不透明：tk 会在配置变化时重设窗口属性，
+        # 手动改 WS_EX_LAYERED 会被它改回去，所以必须走 tk 自己的接口。
+        # alpha=1.0 时 tk 会移除分层属性，DWM 不再逐帧合成，也就不会闪黑。
+        try:
+            self.root.attributes("-alpha", 1.0)
+        except Exception:
+            pass
 
     def drag_move(self, e):
         if not getattr(self, "_dragging", False):
             return
-        self.root.geometry("+%d+%d" % (e.x_root - self._dx, e.y_root - self._dy))
+        x, y = e.x_root - self._dx, e.y_root - self._dy
+        hwnd = getattr(self, "_hwnd", None)
+        if hwnd:
+            # 用 SetWindowPos 而不是 tk 的 geometry：后者会触发布局重绘，
+            # 重绘瞬间露出根窗口底色，半透明下就是一闪一闪的黑色
+            try:
+                u = ctypes.windll.user32
+                u.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                           ctypes.c_int, ctypes.c_int,
+                                           ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+                # SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOREDRAW
+                # NOREDRAW 很关键：移动时不重绘，系统直接把已有像素搬到新位置，
+                # 否则每帧重绘会露出背后的桌面（看着就是"黑色背景冒出来"）
+                u.SetWindowPos(ctypes.c_void_p(hwnd), None, x, y, 0, 0, 0x001D)
+                self._last_pos = (x, y)
+                return
+            except Exception:
+                pass
+        self.root.geometry("+%d+%d" % (x, y))
+        self._last_pos = (x, y)
 
     def drag_end(self, e):
         if getattr(self, "_dragging", False):
             self._dragging = False
-            self._set_layered(True)   # 恢复半透明
+            try:
+                self.root.attributes("-alpha", float(self.st.get("alpha", 0.96)))
+            except Exception:
+                pass
+            if getattr(self, "_last_pos", None):
+                # 让 tk 的内部坐标跟上（SetWindowPos 绕过了 tk）
+                try:
+                    self.root.geometry("+%d+%d" % self._last_pos)
+                except Exception:
+                    pass
         self.schedule_save()
 
     def resize_start(self, e):
