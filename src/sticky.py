@@ -214,7 +214,7 @@ class StickyApp:
         self.scale = self._dpi_scale()
         self._save_job = None
         self._loading = False
-        self._overlay = None
+        self._dragging = False
         self.collapsed = False
         self._expanded_h = self.st["h"]
         self.var_topmost = tk.BooleanVar(master=self.root, value=bool(self.st["topmost"]))
@@ -656,12 +656,47 @@ class StickyApp:
         self._expanded_h = h
         self.root.geometry("%dx%d+%d+%d" % (w, h, x, y))
 
+    def _set_layered(self, on):
+        """临时开/关窗口的分层（半透明）属性。
+
+        半透明窗口（WS_EX_LAYERED）快速移动时 DWM 合成跟不上，会闪黑/撕裂。
+        拖动期间关掉它，系统直接 blit 窗口内容，拖完再恢复。
+        """
+        try:
+            u = ctypes.windll.user32
+            hwnd = getattr(self, "_hwnd", None)
+            if not hwnd:
+                u.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+                u.GetAncestor.restype = ctypes.c_void_p
+                hwnd = u.GetAncestor(ctypes.c_void_p(self.root.winfo_id()), 2) \
+                    or self.root.winfo_id()
+            GWL_EXSTYLE = -20
+            WS_EX_LAYERED = 0x00080000
+            u.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            u.GetWindowLongPtrW.restype = ctypes.c_longlong
+            u.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong]
+            u.SetWindowLongPtrW.restype = ctypes.c_longlong
+            ex = int(u.GetWindowLongPtrW(ctypes.c_void_p(hwnd), GWL_EXSTYLE))
+            if on:
+                u.SetWindowLongPtrW(ctypes.c_void_p(hwnd), GWL_EXSTYLE, ex | WS_EX_LAYERED)
+                u.SetLayeredWindowAttributes.argtypes = [
+                    ctypes.c_void_p, ctypes.c_uint, ctypes.c_ubyte, ctypes.c_uint]
+                u.SetLayeredWindowAttributes(
+                    ctypes.c_void_p(hwnd), 0,
+                    max(0, min(255, int(float(self.st.get("alpha", 0.96)) * 255))),
+                    0x00000002)  # LWA_ALPHA
+            else:
+                u.SetWindowLongPtrW(ctypes.c_void_p(hwnd), GWL_EXSTYLE, ex & ~WS_EX_LAYERED)
+            self._hwnd = hwnd
+        except Exception:
+            pass
+
     def drag_start(self, e):
-        """拖动开始：盖一层纯色再移动。
+        """拖动开始。
 
         不能用 SendMessageW(WM_NCLBUTTONDOWN) 交给系统拖 —— 那会让 Python 主线程
-        整个阻塞在 C 调用里，而系统拖动循环还在往窗口派发消息，tk 的 Python 回调
-        在栈被冻住的状态下执行，会直接把 ucrtbase 干崩（BEX64 / c0000409）。
+        整个阻塞在 C 调用里，而系统拖动循环还在派发消息，tk 回调在栈被冻住的状态下
+        执行，会把 ucrtbase 干崩（BEX64 / c0000409）。
         """
         now = time.time()
         if now - getattr(self, "_last_click", 0) < 0.35:
@@ -672,27 +707,18 @@ class StickyApp:
         self._last_click = now
         self._dx = e.x_root - self.root.winfo_x()
         self._dy = e.y_root - self.root.winfo_y()
-        # 纯色遮罩：拖动时正文不重绘，避免高 DPI 下半透明窗口撕裂
-        try:
-            if getattr(self, "_overlay", None) is None:
-                self._overlay = tk.Frame(self.root, bg=self.theme["bar"], bd=0)
-                self._overlay.place(x=0, y=0, relwidth=1, relheight=1)
-                self._overlay.lift()
-        except Exception:
-            self._overlay = None
+        self._dragging = True
+        self._set_layered(False)   # 拖动期间不透明，避免合成闪黑
 
     def drag_move(self, e):
-        if getattr(self, "_overlay", None) is None:
+        if not getattr(self, "_dragging", False):
             return
         self.root.geometry("+%d+%d" % (e.x_root - self._dx, e.y_root - self._dy))
 
     def drag_end(self, e):
-        if getattr(self, "_overlay", None) is not None:
-            try:
-                self._overlay.destroy()
-            except Exception:
-                pass
-            self._overlay = None
+        if getattr(self, "_dragging", False):
+            self._dragging = False
+            self._set_layered(True)   # 恢复半透明
         self.schedule_save()
 
     def resize_start(self, e):
