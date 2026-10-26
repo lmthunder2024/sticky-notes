@@ -216,6 +216,7 @@ class StickyApp:
         self._loading = False
         self._dragging = False
         self._last_pos = None
+        self._win_w = 0
         self.collapsed = False
         self._expanded_h = self.st["h"]
         self.var_topmost = tk.BooleanVar(master=self.root, value=bool(self.st["topmost"]))
@@ -655,6 +656,7 @@ class StickyApp:
             x = max(0, min(int(x), max(0, sw - w)))
             y = max(0, min(int(y), max(0, sh - h)))
         self._expanded_h = h
+        self._win_w = w
         self.root.geometry("%dx%d+%d+%d" % (w, h, x, y))
 
     def _set_layered(self, on):
@@ -766,23 +768,27 @@ class StickyApp:
     def resize_move(self, e):
         w = max(self.S(230), self._rw + (e.x_root - self._rx))
         h = max(self.S(150), self._rh + (e.y_root - self._ry))
+        self._win_w = w
         self.root.geometry("%dx%d" % (w, h))
 
     def toggle_collapse(self):
+        w = self._win_w or self.root.winfo_width()
         if self.collapsed:
-            self.root.geometry("%dx%d" % (self.root.winfo_width(), self._expanded_h))
+            self.root.geometry("%dx%d" % (w, self._expanded_h))
             self.tabbar.pack(fill="x", after=self.titlebar)
             self.statusbar.pack(fill="x", side="bottom")
             self.text_frame.pack(fill="both", expand=True, after=self.tabbar)
             self.grip.place(relx=1.0, rely=1.0, anchor="se", x=-2, y=-2)
             self.collapsed = False
         else:
+            # 宽度用 geometry 的参数口径（_win_w）而不是 winfo_width：
+            # tk 内部记的边框宽度和实际窗口差 26px，每次回读再设回去就会累加变宽
             self._expanded_h = self.root.winfo_height()
             self.tabbar.pack_forget()
             self.text_frame.pack_forget()
             self.statusbar.pack_forget()
             self.grip.place_forget()
-            self.root.geometry("%dx%d" % (self.root.winfo_width(), self.S(30) + 2))
+            self.root.geometry("%dx%d" % (w, self.S(30) + 2))
             self.collapsed = True
         self.btn_fold.configure(text="\u25b2" if self.collapsed else "\u25bc")
         self.root.update_idletasks()
