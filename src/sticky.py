@@ -214,6 +214,7 @@ class StickyApp:
         self.scale = self._dpi_scale()
         self._save_job = None
         self._loading = False
+        self._overlay = None
         self.collapsed = False
         self._expanded_h = self.st["h"]
         self.var_topmost = tk.BooleanVar(master=self.root, value=bool(self.st["topmost"]))
@@ -234,8 +235,7 @@ class StickyApp:
         self._make_borderless()
         self.restore_geometry()
         self.root.bind("<Map>", self._on_map)
-        self.root.after(200, self._make_borderless)
-        self.root.after(600, self._make_borderless)
+        self.root.after(300, self._make_borderless)
         self.root.attributes("-topmost", bool(self.st["topmost"]))
         self.root.attributes("-alpha", float(self.st["alpha"]))
         self.root.after(120, lambda: self.text.focus_force())
@@ -243,34 +243,53 @@ class StickyApp:
 
     # ------------------------------------------------------------ 界面
     def _make_borderless(self):
-        """去掉系统标题栏和边框，但保留任务栏按钮（可以从任务栏最小化/恢复）。"""
+        """去掉系统标题栏和边框，但保留任务栏按钮（可以从任务栏最小化/恢复）。
+
+        必须幂等：SetWindowPos(SWP_FRAMECHANGED) 会触发 <Map>，若这里无条件重设，
+        就会和 _on_map 形成自我触发的死循环，拖动结束后集中爆发直接崩进程。
+        """
         try:
             u = ctypes.windll.user32
-            hwnd = u.GetAncestor(self.root.winfo_id(), 2) or self.root.winfo_id()
+            u.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            u.GetAncestor.restype = ctypes.c_void_p
+            hwnd = u.GetAncestor(ctypes.c_void_p(self.root.winfo_id()), 2) or self.root.winfo_id()
             GWL_STYLE = -16
             try:
+                u.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
                 u.GetWindowLongPtrW.restype = ctypes.c_longlong
-                style = int(u.GetWindowLongPtrW(hwnd, GWL_STYLE))
+                style = int(u.GetWindowLongPtrW(ctypes.c_void_p(hwnd), GWL_STYLE))
                 setter = u.SetWindowLongPtrW
-            except Exception:
+                setter.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong]
+                setter.restype = ctypes.c_longlong
+            except AttributeError:
                 style = int(u.GetWindowLongW(hwnd, GWL_STYLE))
                 setter = u.SetWindowLongW
-            style &= ~0x00C00000   # WS_CAPTION            style &= ~0x00040000   # WS_THICKFRAME
+            # 已经是无标题栏、无粗边框 —— 说明处理过了，直接返回，别再动窗口
+            if not (style & 0x00C00000) and not (style & 0x00040000):
+                self._hwnd = hwnd
+                return
+            style &= ~0x00C00000   # WS_CAPTION
+            style &= ~0x00040000   # WS_THICKFRAME
             style &= ~0x00010000   # WS_MAXIMIZEBOX
             style &= ~0x00080000   # WS_SYSMENU
             style |= 0x00020000    # WS_MINIMIZEBOX
-            setter(hwnd, GWL_STYLE, style)
-            u.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0027)
+            setter(ctypes.c_void_p(hwnd), GWL_STYLE, style)
+            u.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                       ctypes.c_int, ctypes.c_int,
+                                       ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+            u.SetWindowPos(ctypes.c_void_p(hwnd), None, 0, 0, 0, 0, 0x0027)
             self._hwnd = hwnd
         except Exception:
             import traceback
             _log("borderless FAIL\n" + traceback.format_exc())
 
     def _on_map(self, event=None):
-        """从任务栏恢复时重新置顶（iconify 之后 topmost 会失效）。"""
+        """从任务栏恢复时重新置顶（iconify 之后 topmost 会失效）。
+
+        注意这里绝不能再调 _make_borderless，否则形成事件回环。
+        """
         if event is not None and event.widget is not self.root:
             return
-        self.root.after(60, self._make_borderless)
         if self.st.get("topmost"):
             try:
                 self.root.attributes("-topmost", True)
@@ -326,6 +345,7 @@ class StickyApp:
 
         for w in (self.titlebar, self.dot, self.title_lbl):
             w.bind("<Button-1>", self.drag_start)
+            w.bind("<B1-Motion>", self.drag_move)
             w.bind("<ButtonRelease-1>", self.drag_end)
             w.bind("<Button-3>", lambda e: self.show_menu(e))
 
@@ -627,34 +647,52 @@ class StickyApp:
         x, y = self.st.get("x"), self.st.get("y")
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
-        if x is None or y is None or not (-w < x < sw - 40) or not (0 < y < sh - 40):
-            x = sw - w - 40
-            y = 70
+        if x is None or y is None:
+            x, y = sw - w - 40, 70
+        else:
+            # 钳到屏幕内：否则拖到边缘后重启，窗口会一半在屏幕外甚至完全找不到
+            x = max(0, min(int(x), max(0, sw - w)))
+            y = max(0, min(int(y), max(0, sh - h)))
         self._expanded_h = h
         self.root.geometry("%dx%d+%d+%d" % (w, h, x, y))
 
     def drag_start(self, e):
-        """交给系统拖窗口（WM_NCLBUTTONDOWN），比每帧重设 geometry 顺滑得多。"""
+        """拖动开始：盖一层纯色再移动。
+
+        不能用 SendMessageW(WM_NCLBUTTONDOWN) 交给系统拖 —— 那会让 Python 主线程
+        整个阻塞在 C 调用里，而系统拖动循环还在往窗口派发消息，tk 的 Python 回调
+        在栈被冻住的状态下执行，会直接把 ucrtbase 干崩（BEX64 / c0000409）。
+        """
         now = time.time()
         if now - getattr(self, "_last_click", 0) < 0.35:
-            # 350ms 内第二次按下 = 双击，折叠/展开，不启动拖动
+            # 350ms 内第二次按下 = 双击，折叠/展开，不走拖动
             self._last_click = 0
             self.toggle_collapse()
             return "break"
         self._last_click = now
+        self._dx = e.x_root - self.root.winfo_x()
+        self._dy = e.y_root - self.root.winfo_y()
+        # 纯色遮罩：拖动时正文不重绘，避免高 DPI 下半透明窗口撕裂
         try:
-            u = ctypes.windll.user32
-            hwnd = getattr(self, "_hwnd", None) or u.GetAncestor(self.root.winfo_id(), 2)
-            u.ReleaseCapture()
-            u.SendMessageW(ctypes.c_void_p(hwnd), 0x00A1, 2, 0)  # WM_NCLBUTTONDOWN / HTCAPTION
+            if getattr(self, "_overlay", None) is None:
+                self._overlay = tk.Frame(self.root, bg=self.theme["bar"], bd=0)
+                self._overlay.place(x=0, y=0, relwidth=1, relheight=1)
+                self._overlay.lift()
         except Exception:
-            pass
-        self.schedule_save()
+            self._overlay = None
 
     def drag_move(self, e):
-        pass
+        if getattr(self, "_overlay", None) is None:
+            return
+        self.root.geometry("+%d+%d" % (e.x_root - self._dx, e.y_root - self._dy))
 
     def drag_end(self, e):
+        if getattr(self, "_overlay", None) is not None:
+            try:
+                self._overlay.destroy()
+            except Exception:
+                pass
+            self._overlay = None
         self.schedule_save()
 
     def resize_start(self, e):
